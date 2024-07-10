@@ -1,11 +1,17 @@
 from openai import OpenAI
 import streamlit as st
-
-client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
 import requests
 import json
+import re
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Initialize OpenAI API key from secrets
+client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+
+# Initialize vector store for liked recipes
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = []
 
 # Function to get nutritional information from USDA Food Data Central API
 def get_nutritional_info(food_item):
@@ -21,152 +27,79 @@ def get_nutritional_info(food_item):
         st.session_state.logs.append(f"USDA API response: {data}")
         if data["foods"]:
             food_data = data["foods"][0]
-            return json.dumps({
+            nutrients = {nutrient["nutrientName"]: nutrient["value"] for nutrient in food_data["foodNutrients"]}
+            return {
                 "name": food_data["description"],
-                "calories": food_data["foodNutrients"][0]["value"],  # Calories
-                "protein": food_data["foodNutrients"][1]["value"],  # Protein
-                "fat": food_data["foodNutrients"][2]["value"],  # Fat
-                "carbs": food_data["foodNutrients"][3]["value"]  # Carbohydrates
-            })
+                "calories": nutrients.get("Energy", 0),
+                "protein": nutrients.get("Protein", 0),
+                "fat": nutrients.get("Total lipid (fat)", 0),
+                "carbs": nutrients.get("Carbohydrate, by difference", 0)
+            }
     st.session_state.logs.append(f"USDA API failed with status code: {response.status_code}")
-    return json.dumps({"error": "Could not fetch nutritional information"})
+    return {"error": "Could not fetch nutritional information"}
 
-# Function to generate a meal plan
+# Function to generate a meal plan using OpenAI and user preferences
 def generate_meal_plan(name, health_goal, dietary_preferences, meals_per_day):
-    # Placeholder implementation of meal plan generation
-    meal_plan = {
-        "Breakfast": "Oatmeal with fruits",
-        "Lunch": "Grilled chicken salad",
-        "Dinner": "Quinoa and vegetables"
-    }
-    return json.dumps(meal_plan)
+    preferred_recipes = recommend_recipes_from_preferences()
+    if preferred_recipes:
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that creates personalized meal plans using user preferences."},
+            {"role": "user", "content": f"Create a personalized meal plan for {name} with the following details:\nHealth Goal: {health_goal}\nDietary Preferences: {dietary_preferences}\nMeals per Day: {meals_per_day}\nInclude some of these preferred recipes: {preferred_recipes}"}
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that creates personalized meal plans."},
+            {"role": "user", "content": f"Create a personalized meal plan for {name} with the following details:\nHealth Goal: {health_goal}\nDietary Preferences: {dietary_preferences}\nMeals per Day: {meals_per_day}"}
+        ]
+    response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+    meal_plan = response.choices[0].message.content
+    st.session_state.logs.append(f"Generated meal plan: {meal_plan}")
+    return meal_plan
 
-def run_conversation(messages):
-    # Define available functions for OpenAI
-    functions = [
-        {
-            "name": "get_nutritional_info",
-            "description": "Get nutritional information for a specified food item",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "food_item": {"type": "string", "description": "The name of the food item"}
-                },
-                "required": ["food_item"]
-            }
-        },
-        {
-            "name": "generate_meal_plan",
-            "description": "Generate a personalized meal plan",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "The user's name"},
-                    "health_goal": {"type": "string", "description": "The user's health goal"},
-                    "dietary_preferences": {"type": "string", "description": "The user's dietary preferences"},
-                    "meals_per_day": {"type": "integer", "description": "The number of meals per day"}
-                },
-                "required": ["name", "health_goal", "dietary_preferences", "meals_per_day"]
-            }
-        }
+# Function to parse meal plan and extract food items
+def extract_food_items(meal_plan):
+    food_items = re.findall(r"(?<=:).*?(?=\n|$)", meal_plan)
+    st.session_state.logs.append(f"Extracted food items: {food_items}")
+    return [item.strip() for item in food_items if item.strip()]
+
+# Function to calculate total nutritional values
+def calculate_total_nutrition(nutritional_data_list):
+    total_nutrition = {
+        "calories": 0,
+        "protein": 0,
+        "fat": 0,
+        "carbs": 0
+    }
+    for data in nutritional_data_list:
+        if "error" not in data:
+            total_nutrition["calories"] += data.get("calories", 0)
+            total_nutrition["protein"] += data.get("protein", 0)
+            total_nutrition["fat"] += data.get("fat", 0)
+            total_nutrition["carbs"] += data.get("carbs", 0)
+    st.session_state.logs.append(f"Total nutrition calculated: {total_nutrition}")
+    return total_nutrition
+
+# Function to suggest recipes based on ingredients
+def suggest_recipes(ingredients):
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that suggests recipes based on ingredients."},
+        {"role": "user", "content": f"Suggest some recipes using the following ingredients: {ingredients}"}
     ]
+    response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+    recipes = response.choices[0].message.content
+    st.session_state.logs.append(f"Suggested recipes: {recipes}")
+    return recipes
 
-    response = client.chat.completions.create(model="gpt-3.5-turbo",
-    messages=messages,
-    functions=functions,
-    function_call="auto")
-    response_message = response.choices[0].message
-    function_call = response_message.function_call
-    # Step 2: check if the model wanted to call a function
-    if function_call:
-        function_name = function_call.name
-        function_args = json.loads(function_call.arguments)
-        if function_name == "get_nutritional_info":
-            function_response = get_nutritional_info(
-                food_item=function_args.get("food_item")
-            )
-        elif function_name == "generate_meal_plan":
-            function_response = generate_meal_plan(
-                name=function_args.get("name"),
-                health_goal=function_args.get("health_goal"),
-                dietary_preferences=function_args.get("dietary_preferences"),
-                meals_per_day=function_args.get("meals_per_day")
-            )
-        messages.append({
-            "role": "function",
-            "name": function_name,
-            "content": function_response,
-        })  # extend conversation with function response
-        second_response = client.chat.completions.create(model="gpt-3.5-turbo",
-        messages=messages)  # get a new response from the model where it can see the function response
-        return second_response
-    return response
+# Function to store liked recipe in vector store
+def store_liked_recipe(recipe):
+    st.session_state.vector_store.append(recipe)
+    st.session_state.logs.append(f"Stored liked recipe: {recipe}")
 
-# Initialize session state
-if "state" not in st.session_state:
-    st.session_state.state = "start"
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-if "usda_api_key" not in st.session_state:
-    st.session_state.usda_api_key = ""
-if "nutrition_info" not in st.session_state:
-    st.session_state.nutrition_info = {}
-if "meal_plan" not in st.session_state:
-    st.session_state.meal_plan = {}
-if "total_nutrition_info" not in st.session_state:
-    st.session_state.total_nutrition_info = ""
-
-# Check for USDA API key in secrets, if not found prompt the user to enter it
-if not st.secrets.get("USDA_API_KEY", ""):
-    st.session_state.usda_api_key = st.text_input("Enter your USDA API key:", type="password")
-
-# Define the dialog tree
-dialog_tree = {
-    "start": {
-        "message": "Welcome to the AI Nutritionist! I can help you with the following:\n1. Find the nutritional content of a dish\n2. Create a personalized meal plan\n\nPlease type 'nutrition' to find nutritional content or 'meal plan' to create a meal plan.",
-        "next_state": "get_action"
-    },
-    "get_action": {
-        "message": "What would you like to do today? Type 'nutrition' for nutritional content or 'meal plan' for a personalized meal plan.",
-        "next_state": "process_action"
-    },
-    "process_action": {
-        "nutrition": {
-            "message": "Please tell me the name and portion size of the dish you want to find the nutritional content for.",
-            "next_state": "provide_nutrition_info"
-        },
-        "meal plan": {
-            "message": "Let's get started with your personalized meal plan. What is your name?",
-            "next_state": "get_name"
-        }
-    },
-    "provide_nutrition_info": {
-        "message": "Nutritional Information for {food_item} ({portion_size}):\n{nutrition_info}",
-        "next_state": None
-    },
-    "get_name": {
-        "message": "Hi {name}! What is your main health goal? (e.g., lose weight, build muscle, maintain health)",
-        "next_state": "get_health_goal"
-    },
-    "get_health_goal": {
-        "message": "Great! Do you have any dietary preferences or restrictions? (e.g., vegan, vegetarian, no dairy)",
-        "next_state": "get_dietary_preferences"
-    },
-    "get_dietary_preferences": {
-        "message": "Got it. How many meals would you like to have in a day? (e.g., 3, 4, 5)",
-        "next_state": "get_meals_per_day"
-    },
-    "get_meals_per_day": {
-        "message": "Thank you! Based on the information provided, here is your personalized meal plan.",
-        "next_state": "provide_meal_plan"
-    },
-    "provide_meal_plan": {
-        "message": "Meal Plan for {name}:\n- Goal: {health_goal}\n- Dietary Preferences: {dietary_preferences}\n- Meals per Day: {meals_per_day}\n\n{meal_plan}\n\nTotal Nutrition Information:\n{total_nutrition_info}",
-        "next_state": None
-    }
-}
+# Function to recommend recipes based on stored preferences
+def recommend_recipes_from_preferences():
+    if st.session_state.vector_store:
+        return st.session_state.vector_store
+    return None
 
 # Function to handle dialog
 def handle_dialog(state, user_input=None):
@@ -178,7 +111,7 @@ def handle_dialog(state, user_input=None):
         if st.session_state.action in dialog_tree["process_action"]:
             return dialog_tree["process_action"][st.session_state.action]["message"], dialog_tree["process_action"][st.session_state.action]["next_state"], True
         else:
-            return "I didn't catch that. Please type 'nutrition' for nutritional content or 'meal plan' for a personalized meal plan.", state, False
+            return "I didn't catch that. Please type 'nutrition' for nutritional content, 'meal plan' for a personalized meal plan, or 'recipe' to suggest a recipe.", state, False
     elif state == "provide_nutrition_info":
         # Extract food item and portion size
         parts = user_input.split(" of ")
@@ -239,51 +172,25 @@ def handle_dialog(state, user_input=None):
     elif state == "get_meals_per_day":
         st.session_state.meals_per_day = user_input
         if st.session_state.meals_per_day:
-            # Generate a meal plan
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"Generate a personalized meal plan for {st.session_state.name} with the following details: health goal - {st.session_state.health_goal}, dietary preferences - {st.session_state.dietary_preferences}, meals per day - {st.session_state.meals_per_day}. Please return the meal plan in JSON format."},
-            ]
-            with st.spinner('Generating meal plan...'):
-                response = run_conversation(messages)
+            st.session_state.meal_plan = generate_meal_plan(
+                st.session_state.name,
+                st.session_state.health_goal,
+                st.session_state.dietary_preferences,
+                st.session_state.meals_per_day
+            )
 
-            # Extract and display the meal plan
-            if response.choices:
-                response_message = response.choices[0].message
-                st.session_state.logs.append(f"Function call response: {response_message}")
-                if response_message.role == "assistant":
-                    try:
-                        meal_plan = json.loads(response_message.content)
-                        if "error" not in meal_plan:
-                            st.session_state.meal_plan = meal_plan
-                            # Get nutritional information for each meal
-                            nutritional_info = {}
-                            total_calories = total_protein = total_fat = total_carbs = 0
-                            for meal, item in meal_plan.items():
-                                nutrition_response = get_nutritional_info(item)
-                                nutrition_data = json.loads(nutrition_response)
-                                nutritional_info[meal] = nutrition_data
-                                total_calories += nutrition_data.get("calories", 0)
-                                total_protein += nutrition_data.get("protein", 0)
-                                total_fat += nutrition_data.get("fat", 0)
-                                total_carbs += nutrition_data.get("carbs", 0)
-                            st.session_state.nutritional_info = nutritional_info
-                            st.session_state.total_nutrition_info = f"Total Calories: {total_calories}\nTotal Protein: {total_protein}g\nTotal Fat: {total_fat}g\nTotal Carbohydrates: {total_carbs}g"
-                            return dialog_tree[state]["message"].format(
-                                name=st.session_state.name,
-                                health_goal=st.session_state.health_goal,
-                                dietary_preferences=st.session_state.dietary_preferences,
-                                meals_per_day=st.session_state.meals_per_day,
-                                meal_plan=json.dumps(meal_plan, indent=2),
-                                total_nutrition_info=st.session_state.total_nutrition_info
-                            ), dialog_tree[state]["next_state"], True
-                        else:
-                            return "I couldn't generate the meal plan. Please try again.", state, False
-                    except json.JSONDecodeError:
-                        return "I received an invalid response. Please try again.", state, False
-            else:
-                st.session_state.logs.append("Error: Couldn't generate meal plan")
-                return "I couldn't generate the meal plan. Please try again.", state, False
+            # Extract food items from the meal plan
+            food_items = extract_food_items(st.session_state.meal_plan)
+            nutritional_data_list = []
+            for item in food_items:
+                nutritional_data = get_nutritional_info(item)
+                nutritional_data_list.append(nutritional_data)
+
+            # Calculate total nutritional values
+            total_nutrition = calculate_total_nutrition(nutritional_data_list)
+            st.session_state.total_nutrition = total_nutrition
+
+            return dialog_tree[state]["message"], dialog_tree[state]["next_state"], True
         else:
             return "I didn't catch that. How many meals would you like to have in a day? (e.g., 3, 4, 5)", state, False
     elif state == "provide_meal_plan":
@@ -292,10 +199,116 @@ def handle_dialog(state, user_input=None):
             health_goal=st.session_state.health_goal,
             dietary_preferences=st.session_state.dietary_preferences,
             meals_per_day=st.session_state.meals_per_day,
-            meal_plan=json.dumps(st.session_state.meal_plan, indent=2),
-            total_nutrition_info=st.session_state.total_nutrition_info
-        ), dialog_tree[state]["next_state"], True
+            meal_plan=st.session_state.meal_plan
+        ) + f"\n\nTotal Nutrition for the day:\nCalories: {st.session_state.total_nutrition['calories']} kcal\nProtein: {st.session_state.total_nutrition['protein']} g\nFat: {st.session_state.total_nutrition['fat']} g\nCarbs: {st.session_state.total_nutrition['carbs']} g", dialog_tree[state]["next_state"], True
+    elif state == "suggest_recipe":
+        st.session_state.ingredients = user_input
+        recipes = suggest_recipes(user_input)
+        st.session_state.suggested_recipes = recipes
+        return recipes, "store_recipe", True
+    elif state == "store_recipe":
+        if user_input.lower() == "yes":
+            store_liked_recipe(st.session_state.suggested_recipes)
+            return "Recipe stored successfully!", "start", True
+        else:
+            return "Recipe not stored.", "start", True
     return "Unexpected state.", state, False  # Ensure the function always returns a tuple
+
+# Initialize session state
+if "state" not in st.session_state:
+    st.session_state.state = "start"
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+if "usda_api_key" not in st.session_state:
+    st.session_state.usda_api_key = ""
+if "food_item" not in st.session_state:
+    st.session_state.food_item = ""
+if "portion_size" not in st.session_state:
+    st.session_state.portion_size = ""
+if "nutrition_info" not in st.session_state:
+    st.session_state.nutrition_info = {}
+if "action" not in st.session_state:
+    st.session_state.action = ""
+if "name" not in st.session_state:
+    st.session_state.name = ""
+if "health_goal" not in st.session_state:
+    st.session_state.health_goal = ""
+if "dietary_preferences" not in st.session_state:
+    st.session_state.dietary_preferences = ""
+if "meals_per_day" not in st.session_state:
+    st.session_state.meals_per_day = ""
+if "meal_plan" not in st.session_state:
+    st.session_state.meal_plan = ""
+if "total_nutrition" not in st.session_state:
+    st.session_state.total_nutrition = {}
+if "ingredients" not in st.session_state:
+    st.session_state.ingredients = ""
+if "suggested_recipes" not in st.session_state:
+    st.session_state.suggested_recipes = ""
+
+# Check for USDA API key in secrets, if not found prompt the user to enter it
+if not st.secrets.get("USDA_API_KEY", ""):
+    st.session_state.usda_api_key = st.text_input("Enter your USDA API key:", type="password")
+
+# Define the dialog tree
+dialog_tree = {
+    "start": {
+        "message": "Welcome to the AI Nutritionist! I can help you with the following:\n1. Find the nutritional content of a dish\n2. Create a personalized meal plan\n3. Suggest a recipe based on ingredients\n\nPlease type 'nutrition' to find nutritional content, 'meal plan' to create a meal plan, or 'recipe' to suggest a recipe.",
+        "next_state": "get_action"
+    },
+    "get_action": {
+        "message": "What would you like to do today? Type 'nutrition' for nutritional content, 'meal plan' for a personalized meal plan, or 'recipe' to suggest a recipe.",
+        "next_state": "process_action"
+    },
+    "process_action": {
+        "nutrition": {
+            "message": "Please tell me the name and portion size of the dish you want to find the nutritional content for.",
+            "next_state": "provide_nutrition_info"
+        },
+        "meal plan": {
+            "message": "Let's get started with your personalized meal plan. What is your name?",
+            "next_state": "get_name"
+        },
+        "recipe": {
+            "message": "Please enter the ingredients you have (comma separated):",
+            "next_state": "suggest_recipe"
+        }
+    },
+    "provide_nutrition_info": {
+        "message": "Nutritional Information for {food_item} ({portion_size}):\n{nutrition_info}",
+        "next_state": None
+    },
+    "get_name": {
+        "message": "Hi {name}! What is your main health goal? (e.g., lose weight, build muscle, maintain health)",
+        "next_state": "get_health_goal"
+    },
+    "get_health_goal": {
+        "message": "Great! Do you have any dietary preferences or restrictions? (e.g., vegan, vegetarian, no dairy)",
+        "next_state": "get_dietary_preferences"
+    },
+    "get_dietary_preferences": {
+        "message": "Got it. How many meals would you like to have in a day? (e.g., 3, 4, 5)",
+        "next_state": "get_meals_per_day"
+    },
+    "get_meals_per_day": {
+        "message": "Thank you! Based on the information provided, here is your personalized meal plan.",
+        "next_state": "provide_meal_plan"
+    },
+    "provide_meal_plan": {
+        "message": "Meal Plan for {name}:\n- Goal: {health_goal}\n- Dietary Preferences: {dietary_preferences}\n- Meals per Day: {meals_per_day}\n\n{meal_plan}",
+        "next_state": None
+    },
+    "suggest_recipe": {
+        "message": "Here are some recipes you can make with the ingredients: {suggested_recipes}\nDo you want to store this recipe? (yes/no)",
+        "next_state": "store_recipe"
+    },
+    "store_recipe": {
+        "message": "Do you want to store this recipe? (yes/no)",
+        "next_state": None
+    }
+}
 
 # Display existing chat messages
 st.title("🍽️ AI-Powered Nutritionist Chatbot")
@@ -321,23 +334,8 @@ def handle_user_response(prompt):
 if prompt := st.chat_input("Your response:"):
     handle_user_response(prompt)
 
-# JavaScript to focus on the input box
-st.markdown(
-    """
-    <script>
-    setTimeout(function() {
-        var inputBox = window.parent.document.querySelector('input[type="text"]');
-        if (inputBox) {
-            inputBox.focus();
-        }
-    }, 100);
-    </script>
-    """,
-    unsafe_allow_html=True
-)
-
-# # Display logs for debugging
-# if st.session_state.logs:
-#     st.subheader("Logs")
-#     for log in st.session_state.logs:
-#         st.write(log)
+# Display logs for debugging
+if st.session_state.logs:
+    st.subheader("Logs")
+    for log in st.session_state.logs:
+        st.write(log)
