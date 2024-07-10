@@ -334,8 +334,8 @@ def handle_user_response(prompt):
 if prompt := st.chat_input("Your response:"):
     handle_user_response(prompt)
 
-# Display logs for debugging
-if st.session_state.logs:
-    st.subheader("Logs")
-    for log in st.session_state.logs:
-        st.write(log)
+# # Display logs for debugging
+# if st.session_state.logs:
+#     st.subheader("Logs")
+#     for log in st.session_state.logs:
+#         st.write(log)
